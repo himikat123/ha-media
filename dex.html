@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Samsung DeX Relative Hover KVM Bridge</title>
+    <style>
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: #000; overflow: hidden;
+            display: flex; justify-content: center; align-items: center;
+            font-family: sans-serif;
+        }
+        .container { position: relative; width: 1600px; height: 900px; }
+        video { width: 1600px; height: 900px; object-fit: none; background-color: #000; }
+        
+        #mouse-overlay { 
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
+            z-index: 10; outline: none; cursor: default; 
+        }
+
+        #connectBtn {
+            position: fixed; top: 10px; left: 10px; z-index: 20;
+            padding: 8px 15px; background: #28a745; color: white; border: none; border-radius: 4px;
+            cursor: pointer; opacity: 0.7; transition: opacity 0.2s;
+        }
+        #connectBtn:hover { opacity: 1; }
+
+        /* ЖЕСТКОЕ СКРЫТИЕ КУРСОРA WINDOWS ПОСЛЕ ПОДКЛЮЧЕНИЯ */
+        .connected-mode #mouse-overlay {
+            cursor: none !important;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <button id="connectBtn">1. Подключить Blue Pill (UART)</button>
+        <div id="mouse-overlay" tabindex="0"></div>
+        <video id="dexStream" autoplay playsinline></video>
+    </div>
+
+    <script>
+        let port, writer;
+        let buttonMask = 0; 
+        let lastX = null;
+        let lastY = null;
+
+        const overlay = document.getElementById('mouse-overlay');
+        const connectBtn = document.getElementById('connectBtn');
+
+        // Подключение к UART
+        connectBtn.addEventListener('click', async () => {
+            try {
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+                writer = port.writable.getWriter();
+                
+                // АКТИВИРУЕМ РЕЖИМ СКРЫТИЯ КУРСОРA В CSS
+                document.body.classList.add('connected-mode');
+                
+                // ПОЛНОСТЬЮ УБИРАЕМ КНОПКУ ПОДКЛЮЧЕНИЯ С ЭКРАНА
+                connectBtn.style.display = 'none';
+                
+                overlay.focus();
+            } catch (err) {
+                console.error("Ошибка UART:", err);
+                alert("Не удалось подключить устройство. Убедитесь, что страница открыта через http:// localhost, а не как локальный файл file:///");
+            }
+        });
+
+        // Функция отправки пакета в Blue Pill
+        async function sendPacket(type, dx, dy, d1, d2) {
+            if (!writer) return;
+            const data = `${type},${dx},${dy},${d1},${d2}\n`;
+            const encoder = new TextEncoder();
+            try {
+                await writer.write(encoder.encode(data));
+            } catch (err) {
+                console.error("Ошибка записи:", err);
+            }
+        }
+
+        // ОТСЛЕЖИВАНИЕ ДВИЖЕНИЯ КУРСОРA (Вычисляем относительные дельты dX и dY)
+        overlay.addEventListener('mousemove', (e) => {
+            if (lastX === null || lastY === null) {
+                lastX = e.offsetX;
+                lastY = e.offsetY;
+                return;
+            }
+
+            const dx = e.offsetX - lastX;
+            const dy = e.offsetY - lastY;
+
+            lastX = e.offsetX;
+            lastY = e.offsetY;
+
+            if (dx !== 0 || dy !== 0 || buttonMask !== 0) {
+                sendPacket('M', dx, dy, buttonMask, 0);
+            }
+        });
+
+        // Сброс координат при уходе мыши за пределы экрана DeX
+        overlay.addEventListener('mouseleave', () => {
+            lastX = null;
+            lastY = null;
+            if (buttonMask !== 0) {
+                buttonMask = 0;
+                sendPacket('M', 0, 0, 0, 0); 
+            }
+        });
+
+        // ОБРАБОТКА НАЖАТИЙ МЫШИ (Левая, Правая, Колесико)
+        overlay.addEventListener('mousedown', (e) => {
+            overlay.focus(); 
+            if (e.button === 0) buttonMask |= 1;  
+            if (e.button === 2) buttonMask |= 2;  
+            if (e.button === 1) buttonMask |= 4;  
+            sendPacket('M', 0, 0, buttonMask, 0);
+        });
+
+        overlay.addEventListener('mouseup', (e) => {
+            if (e.button === 0) buttonMask &= ~1;
+            if (e.button === 2) buttonMask &= ~2;
+            if (e.button === 1) buttonMask &= ~4;
+            sendPacket('M', 0, 0, buttonMask, 0);
+        });
+
+        // ОБРАБОТКА СКРОЛЛА (Колесико мыши)
+        overlay.addEventListener('wheel', async (e) => {
+            e.preventDefault();
+            const wheelDir = e.deltaY < 0 ? 1 : -1;
+            await sendPacket('W', 0, 0, wheelDir, 0);
+            await sendPacket('W', 0, 0, 0, 0); 
+        });
+
+        // ОБРАБОТКА КЛАВИАТУРЫ
+        overlay.addEventListener('keydown', (e) => {
+            e.preventDefault(); 
+            sendPacket('K', 0, 0, getUsbKeycode(e), 1);
+        });
+
+        overlay.addEventListener('keyup', (e) => {
+            e.preventDefault();
+            sendPacket('K', 0, 0, getUsbKeycode(e), 0);
+        });
+
+        function getUsbKeycode(e) {
+            const specialKeys = {
+                'Enter': 13, 'Backspace': 178, 'Tab': 179, 'Escape': 177,
+                'ArrowUp': 218, 'ArrowDown': 217, 'ArrowLeft': 216, 'ArrowRight': 215,
+                'Control': 128, 'Shift': 129, 'Alt': 130, 'Meta': 131
+            };
+            
+            if (specialKeys[e.key]) return specialKeys[e.key];
+
+            if (e.code.startsWith('Key')) {
+                return e.code.replace('Key', '').toLowerCase().charCodeAt(0);
+            }
+            if (e.code.startsWith('Digit')) {
+                return e.code.replace('Digit', '').charCodeAt(0);
+            }
+            
+            return e.key.charCodeAt(0); 
+        }
+
+        overlay.addEventListener('contextmenu', e => e.preventDefault());
+
+        // Автоматический захват видеопотока с платы захвата
+        async function initDeX() {
+            try {
+                await navigator.mediaDevices.getUserMedia({ video: true });
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const videoDevices = devices.filter(device => device.kind === 'videoinput');
+                let targetDeviceId = null;
+                for (const device of videoDevices) {
+                    const label = device.label.toLowerCase();
+                    if (label.includes('capture') || label.includes('USB3 Video') || label.includes('hdmi')) {
+                        targetDeviceId = device.deviceId; break;
+                    }
+                }
+                if (!targetDeviceId && videoDevices.length > 0) targetDeviceId = videoDevices[videoDevices.length - 1].deviceId;
+
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { deviceId: targetDeviceId ? { exact: targetDeviceId } : undefined, width: { exact: 1600 }, height: { exact: 900 }, frameRate: { ideal: 60 } },
+                    audio: false
+                });
+                document.getElementById('dexStream').srcObject = stream;
+            } catch (error) {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1600 }, height: { ideal: 900 } }, audio: false });
+                document.getElementById('dexStream').srcObject = stream;
+            }
+        }
+        window.addEventListener('DOMContentLoaded', initDeX);
+    </script>
+</body>
+</html>
